@@ -1,4 +1,14 @@
-use std::{collections::HashSet, io, net::SocketAddr, str::FromStr, time::Duration};
+use std::{
+    collections::HashSet,
+    io,
+    net::SocketAddr,
+    str::FromStr,
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
 
 use bitcoin::{
     consensus::{deserialize_partial, serialize},
@@ -12,8 +22,10 @@ use bitcoin::{
 use chrono::Utc;
 use rand::{thread_rng, Rng};
 use tokio::{
+    join,
     net::{lookup_host, TcpStream},
-    time::timeout,
+    task::JoinHandle,
+    time::{error::Elapsed, timeout},
 };
 use tokio_util::{
     bytes::Buf,
@@ -26,32 +38,22 @@ const TIMEOUT_FUN: u64 = 6_000;
 
 #[tokio::main]
 async fn main() {
-    let local_address = SocketAddr::from_str("127.0.0.1:8333").unwrap();
+    //let local_address = SocketAddr::from_str("127.0.0.1:8333").unwrap();
 
     let seed_nodes = get_seed_nodes().await;
     println!("Seeds: {seed_nodes:?}");
 
-    let remote_address = seed_nodes.iter().next().unwrap();
+    let set_nodes: HashSet<Address> = HashSet::new();
+    let set_nodes = Arc::new(Mutex::new(set_nodes));
 
-    let mut stream = connect_node(remote_address).await;
-    println!("connect_node");
+    // Create threadpool
+    let thread_pool = ThreadPool::new(5, set_nodes.clone()); // TODO size = user input?
+    thread_pool.execute(seed_nodes);
 
-    timeout(
-        Duration::from_millis(TIMEOUT_FUN),
-        perform_handshake(&mut stream, remote_address, &local_address),
-    )
-    .await
-    .unwrap();
-    println!("perform_handshake");
+    //thread_pool.kill();
+    thread_pool.join().await;
 
-    let set_nodes = timeout(
-        Duration::from_millis(TIMEOUT_FUN),
-        perform_get_addr(&mut stream),
-    )
-    .await
-    .unwrap();
-
-    println!("Nodes: {set_nodes:?} {}", set_nodes.len());
+    println!("#### set_nodes: {}", set_nodes.lock().unwrap().len());
 }
 
 async fn get_seed_nodes() -> HashSet<SocketAddr> {
@@ -165,4 +167,120 @@ fn get_version_message(remote_address: &SocketAddr, local_address: &SocketAddr) 
         "".to_string(), // TODO user_agent
         0,
     )
+}
+
+struct Worker {
+    id: usize,
+    thread: JoinHandle<()>,
+}
+
+impl Worker {
+    fn new(
+        id: usize,
+        receiver: Arc<Mutex<Receiver<WorkerMessage>>>,
+        set_nodes: Arc<Mutex<HashSet<Address>>>,
+    ) -> Self {
+        println!("worker: {id}");
+        Self {
+            id,
+            thread: tokio::task::spawn(async move {
+                loop {
+                    let receiver_lock = receiver.clone();
+
+                    let message = receiver.lock().unwrap().recv().unwrap();
+
+                    match message {
+                        WorkerMessage::Message(address) => {
+                            println!("thread: {id} address: {address}");
+                            let _ = worker_function(address, &set_nodes).await;
+                            drop(receiver_lock);
+                        }
+                        WorkerMessage::Kill => {
+                            println!("Killing thread: {id}");
+                            drop(receiver_lock);
+                            break;
+                        }
+                    }
+                }
+            }),
+        }
+    }
+}
+
+struct ThreadPool {
+    workers: Vec<Worker>,
+    sender: Sender<WorkerMessage>,
+}
+
+impl ThreadPool {
+    fn new(size: usize, set_nodes: Arc<Mutex<HashSet<Address>>>) -> Self {
+        let mut workers = Vec::with_capacity(size);
+
+        let (sender, receiver) = mpsc::channel::<WorkerMessage>();
+
+        let receiver = Arc::new(Mutex::new(receiver));
+
+        for i in 0..size {
+            workers.push(Worker::new(i, receiver.clone(), set_nodes.clone()))
+        }
+
+        Self { workers, sender }
+    }
+
+    fn execute(&self, seed_nodes: HashSet<SocketAddr>) {
+        seed_nodes
+            .iter()
+            .for_each(|addr| self.sender.send(WorkerMessage::Message(*addr)).unwrap());
+        // Change to &
+
+        println!("sending kill");
+        self.kill();
+    }
+
+    fn kill(&self) {
+        self.workers.iter().for_each(|_w| {
+            self.sender.send(WorkerMessage::Kill).unwrap();
+        })
+    }
+
+    async fn join(self) {
+        for worker in self.workers {
+            let _ = join!(worker.thread);
+        }
+    }
+}
+
+async fn worker_function(
+    remote_address: SocketAddr,
+    set_nodes: &Arc<Mutex<HashSet<Address>>>,
+) -> Result<(), Elapsed> {
+    let local_address = SocketAddr::from_str("127.0.0.1:8333").unwrap();
+
+    let mut stream = connect_node(&remote_address).await;
+    println!("connect_node");
+
+    timeout(
+        Duration::from_millis(TIMEOUT_FUN),
+        perform_handshake(&mut stream, &remote_address, &local_address),
+    )
+    .await?;
+
+    println!("perform_handshake");
+
+    let nodes = timeout(
+        Duration::from_millis(TIMEOUT_FUN),
+        perform_get_addr(&mut stream),
+    )
+    .await?;
+
+    set_nodes.lock().unwrap().extend(nodes.into_iter());
+
+    //println!("thread: {id} - nodes: {set_nodes:?}");
+
+    Ok(())
+}
+
+enum WorkerMessage {
+    Message(SocketAddr),
+    Kill,
 }
