@@ -35,35 +35,35 @@ use tokio_util::{
 use futures::{SinkExt, StreamExt};
 
 const TIMEOUT_FUN: u64 = 6_000;
+const TIMEOUT_CONNECTION: u64 = 500;
+const LOCAL_ADDRESS: &str = "127.0.0.1:8333";
+const POOL_SIZE: usize = 5;
+const SEED_NODE: &str = "seed.bitcoin.sipa.be";
+const MAINNET_PORT: u16 = 8333;
 
 #[tokio::main]
 async fn main() {
-    //let local_address = SocketAddr::from_str("127.0.0.1:8333").unwrap();
-
     let seed_nodes = get_seed_nodes().await;
     println!("Seeds: {seed_nodes:?}");
 
-    let set_nodes: HashSet<Address> = HashSet::new();
-    let set_nodes = Arc::new(Mutex::new(set_nodes));
+    let set_nodes = Arc::new(Mutex::new(HashSet::new()));
 
-    // Create threadpool
-    let thread_pool = ThreadPool::new(5, set_nodes.clone()); // TODO size = user input?
+    let thread_pool = ThreadPool::new(POOL_SIZE, set_nodes.clone());
     thread_pool.execute(seed_nodes);
 
-    //thread_pool.kill();
     thread_pool.join().await;
 
-    println!("#### set_nodes: {}", set_nodes.lock().unwrap().len());
+    println!("Nodes collected: {}", set_nodes.lock().unwrap().len());
 }
 
 async fn get_seed_nodes() -> HashSet<SocketAddr> {
-    HashSet::from_iter(lookup_host(("seed.bitcoin.sipa.be", 8333)).await.unwrap())
+    HashSet::from_iter(lookup_host((SEED_NODE, MAINNET_PORT)).await.unwrap())
 }
 
 async fn connect_node(remote_address: &SocketAddr) -> Framed<TcpStream, BitcoinCodec> {
     let connection = TcpStream::connect(remote_address);
 
-    let stream = timeout(Duration::from_millis(500), connection)
+    let stream = timeout(Duration::from_millis(TIMEOUT_CONNECTION), connection)
         .await
         .unwrap()
         .unwrap();
@@ -170,6 +170,7 @@ fn get_version_message(remote_address: &SocketAddr, local_address: &SocketAddr) 
 }
 
 struct Worker {
+    #[allow(dead_code)] // I'm using it only for printing
     id: usize,
     thread: JoinHandle<()>,
 }
@@ -180,7 +181,6 @@ impl Worker {
         receiver: Arc<Mutex<Receiver<WorkerMessage>>>,
         set_nodes: Arc<Mutex<HashSet<Address>>>,
     ) -> Self {
-        println!("worker: {id}");
         Self {
             id,
             thread: tokio::task::spawn(async move {
@@ -191,7 +191,7 @@ impl Worker {
 
                     match message {
                         WorkerMessage::Message(address) => {
-                            println!("thread: {id} address: {address}");
+                            println!("Thread: {id} - address: {address}");
                             let _ = worker_function(address, &set_nodes).await;
                             drop(receiver_lock);
                         }
@@ -231,9 +231,9 @@ impl ThreadPool {
         seed_nodes
             .iter()
             .for_each(|addr| self.sender.send(WorkerMessage::Message(*addr)).unwrap());
-        // Change to &
+        // TODO Change to &
 
-        println!("sending kill");
+        println!("Sending kill");
         self.kill();
     }
 
@@ -254,18 +254,15 @@ async fn worker_function(
     remote_address: SocketAddr,
     set_nodes: &Arc<Mutex<HashSet<Address>>>,
 ) -> Result<(), Elapsed> {
-    let local_address = SocketAddr::from_str("127.0.0.1:8333").unwrap();
+    let local_address = SocketAddr::from_str(LOCAL_ADDRESS).unwrap();
 
     let mut stream = connect_node(&remote_address).await;
-    println!("connect_node");
 
     timeout(
         Duration::from_millis(TIMEOUT_FUN),
         perform_handshake(&mut stream, &remote_address, &local_address),
     )
     .await?;
-
-    println!("perform_handshake");
 
     let nodes = timeout(
         Duration::from_millis(TIMEOUT_FUN),
@@ -274,8 +271,6 @@ async fn worker_function(
     .await?;
 
     set_nodes.lock().unwrap().extend(nodes.into_iter());
-
-    //println!("thread: {id} - nodes: {set_nodes:?}");
 
     Ok(())
 }
