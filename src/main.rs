@@ -1,3 +1,5 @@
+mod errors;
+
 use std::{
     collections::HashSet,
     io,
@@ -20,12 +22,13 @@ use bitcoin::{
     Network,
 };
 use chrono::Utc;
+use errors::CrawlerError;
 use rand::{thread_rng, Rng};
 use tokio::{
     join,
     net::{lookup_host, TcpStream},
     task::JoinHandle,
-    time::{error::Elapsed, timeout},
+    time::timeout,
 };
 use tokio_util::{
     bytes::Buf,
@@ -36,14 +39,14 @@ use futures::{SinkExt, StreamExt};
 
 const TIMEOUT_FUN: u64 = 6_000;
 const TIMEOUT_CONNECTION: u64 = 500;
-const LOCAL_ADDRESS: &str = "127.0.0.1:8333";
 const POOL_SIZE: usize = 5;
+const LOCAL_ADDRESS: &str = "127.0.0.1:8333";
 const SEED_NODE: &str = "seed.bitcoin.sipa.be";
 const MAINNET_PORT: u16 = 8333;
 
 #[tokio::main]
-async fn main() {
-    let seed_nodes = get_seed_nodes().await;
+async fn main() -> Result<(), CrawlerError> {
+    let seed_nodes = get_seed_nodes().await?;
     println!("Seeds: {seed_nodes:?}");
 
     let set_nodes = Arc::new(Mutex::new(HashSet::new()));
@@ -54,71 +57,91 @@ async fn main() {
     thread_pool.join().await;
 
     println!("Nodes collected: {}", set_nodes.lock().unwrap().len());
+    Ok(())
 }
 
-async fn get_seed_nodes() -> HashSet<SocketAddr> {
-    HashSet::from_iter(lookup_host((SEED_NODE, MAINNET_PORT)).await.unwrap())
+async fn get_seed_nodes() -> Result<HashSet<SocketAddr>, CrawlerError> {
+    let lookup_host = lookup_host((SEED_NODE, MAINNET_PORT))
+        .await
+        .map_err(CrawlerError::LookupError)?;
+    Ok(HashSet::from_iter(lookup_host))
 }
 
-async fn connect_node(remote_address: &SocketAddr) -> Framed<TcpStream, BitcoinCodec> {
+async fn connect_node(
+    remote_address: &SocketAddr,
+) -> Result<Framed<TcpStream, BitcoinCodec>, CrawlerError> {
     let connection = TcpStream::connect(remote_address);
 
     let stream = timeout(Duration::from_millis(TIMEOUT_CONNECTION), connection)
         .await
-        .unwrap()
-        .unwrap();
-    Framed::new(stream, BitcoinCodec {})
+        .map_err(CrawlerError::Timeout)?
+        .map_err(CrawlerError::ConnectionError)?;
+
+    Ok(Framed::new(stream, BitcoinCodec {}))
 }
 
 async fn perform_handshake(
     stream: &mut Framed<TcpStream, BitcoinCodec>,
     remote_address: &SocketAddr,
     local_address: &SocketAddr,
-) {
+) -> Result<(), CrawlerError> {
     let version_message = RawNetworkMessage::new(
         Network::Bitcoin.magic(),
         NetworkMessage::Version(get_version_message(remote_address, local_address)),
     );
 
-    stream.send(version_message).await.unwrap();
+    stream
+        .send(version_message)
+        .await
+        .map_err(CrawlerError::TcpError)?;
 
     while let Some(message) = stream.next().await {
-        let message = message.unwrap();
+        let message = message.map_err(CrawlerError::TcpError)?;
 
         match message.payload() {
             NetworkMessage::Verack => {
                 let verack_message =
                     RawNetworkMessage::new(Network::Bitcoin.magic(), NetworkMessage::Verack);
 
-                stream.send(verack_message).await.unwrap();
+                stream
+                    .send(verack_message)
+                    .await
+                    .map_err(CrawlerError::TcpError)?;
 
-                return;
+                return Ok(());
             }
             _ => continue,
         }
     }
+
+    Ok(())
 }
 
-async fn perform_get_addr(stream: &mut Framed<TcpStream, BitcoinCodec>) -> HashSet<Address> {
+async fn perform_get_addr(
+    stream: &mut Framed<TcpStream, BitcoinCodec>,
+) -> Result<HashSet<Address>, CrawlerError> {
     let mut set_nodes: HashSet<Address> = HashSet::new();
 
     let get_addr = RawNetworkMessage::new(Network::Bitcoin.magic(), NetworkMessage::GetAddr);
 
-    stream.send(get_addr).await.unwrap();
+    stream
+        .send(get_addr)
+        .await
+        .map_err(CrawlerError::TcpError)?;
 
     while let Some(message) = stream.next().await {
-        let message = message.unwrap();
+        let message = message.map_err(CrawlerError::TcpError)?;
 
         match message.payload().clone() {
             NetworkMessage::Addr(nodes) => {
                 set_nodes.extend(nodes.into_iter().map(|item| item.1));
-                return set_nodes;
+                return Ok(set_nodes);
             }
 
             _ => continue,
         }
     }
-    set_nodes
+    Ok(set_nodes)
 }
 
 struct BitcoinCodec {}
@@ -253,22 +276,25 @@ impl ThreadPool {
 async fn worker_function(
     remote_address: SocketAddr,
     set_nodes: &Arc<Mutex<HashSet<Address>>>,
-) -> Result<(), Elapsed> {
-    let local_address = SocketAddr::from_str(LOCAL_ADDRESS).unwrap();
+) -> Result<(), CrawlerError> {
+    let local_address = SocketAddr::from_str(LOCAL_ADDRESS)
+        .map_err(|_| CrawlerError::InvalidAddress(LOCAL_ADDRESS.to_string()))?;
 
-    let mut stream = connect_node(&remote_address).await;
+    let mut stream = connect_node(&remote_address).await?;
 
     timeout(
         Duration::from_millis(TIMEOUT_FUN),
         perform_handshake(&mut stream, &remote_address, &local_address),
     )
-    .await?;
+    .await
+    .map_err(CrawlerError::Timeout)??;
 
     let nodes = timeout(
         Duration::from_millis(TIMEOUT_FUN),
         perform_get_addr(&mut stream),
     )
-    .await?;
+    .await
+    .map_err(CrawlerError::Timeout)??;
 
     set_nodes.lock().unwrap().extend(nodes.into_iter());
 
